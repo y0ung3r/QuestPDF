@@ -1,27 +1,8 @@
-﻿using System;
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Linq;
 
 namespace QuestPDF.Infrastructure
 {
-    internal enum TextStyleProperty
-    {
-        Color,
-        BackgroundColor,
-        FontFamily,
-        Size,
-        LineHeight,
-        LetterSpacing,
-        FontWeight,
-        FontPosition,
-        IsItalic,
-        HasStrikethrough,
-        HasUnderline,
-        WrapAnywhere,
-        Fallback,
-        Direction
-    }
-    
     internal record StylesApplyingOptions
     {
         public bool OverrideStyle { get; set; }
@@ -33,37 +14,32 @@ namespace QuestPDF.Infrastructure
     
     internal static class TextStyleManager
     {
-        private static readonly ConcurrentDictionary<(TextStyle Origin, TextStyleProperty Property, object Value), TextStyle> TextStyleMutateCache = new();
+        private static readonly ConcurrentDictionary<(TextStyle Origin, TextStyleProperty Property, ITextStyleValueEntry Accessor), TextStyle> TextStyleMutateCache = new();
         private static readonly ConcurrentDictionary<(TextStyle Origin, TextStyle Parent), TextStyle> TextStyleApplyInheritedCache = new();
         private static readonly ConcurrentDictionary<TextStyle, TextStyle> TextStyleApplyGlobalCache = new();
         private static readonly ConcurrentDictionary<(TextStyle Origin, TextStyle Parent), TextStyle> TextStyleOverrideCache = new();
 
-        private static readonly TextStyleProperty[] AvailableStyleProperties =
-            Enum.GetValues(typeof(TextStyleProperty))
-                .OfType<TextStyleProperty>()
-                .ToArray();
-
-        public static TextStyle Mutate(this TextStyle origin, TextStyleProperty property, object value)
+        public static TextStyle Mutate<TValue>(this TextStyle origin, TextStyleProperty<TValue> property, TValue value)
         {
-            var cacheKey = (origin, property, value);
-            return TextStyleMutateCache.GetOrAdd(cacheKey, tuple => tuple.Origin.MutateStyle(tuple.Property, tuple.Value, overrideValue: true));
+            var cacheKey = (origin, property, new TextStyleValueEntry<TValue>(value));
+            return TextStyleMutateCache.GetOrAdd(cacheKey, tuple => tuple.Origin.MutateStyle(tuple.Property, tuple.Accessor, overrideValue: true));
         }
 
-        private static TextStyle MutateStyle(this TextStyle origin, TextStyleProperty property, object? newValue, bool overrideValue)
+        private static TextStyle MutateStyle(this TextStyle origin, TextStyleProperty property, ITextStyleValueEntry newValueEntry, bool overrideValue)
         {
-            if (overrideValue && newValue is null)
+            if (overrideValue && !newValueEntry.HasValue)
                 return origin;
 
-            var oldValue = origin.GetValue(property);
+            var oldValueEntry = origin.GetValueEntry(property);
 
-            if (!overrideValue && oldValue is not null)
+            if (!overrideValue && oldValueEntry.HasValue)
                 return origin;
 
-            if (oldValue == newValue) 
+            if (oldValueEntry.Equals(newValueEntry))
                 return origin;
 
             var textStyleClone = origin with { };
-            textStyleClone.SetValue(property, newValue);
+            textStyleClone.ReplaceEntry(property, newValueEntry);
             
             return textStyleClone;
         }
@@ -107,7 +83,7 @@ namespace QuestPDF.Infrastructure
                 .ApplyStyleProperties(style, options)
                 .UpdateFontFallback(overrideStyle);
             
-            return style.MutateStyle(TextStyleProperty.Fallback, targetFallbackStyle, overrideValue: true);
+            return style.MutateStyle(TextStyleProperty.Fallback, new TextStyleValueEntry<TextStyle>(targetFallbackStyle), overrideValue: true);
         }
         
         internal static TextStyle OverrideStyle(this TextStyle style, TextStyle parent)
@@ -125,17 +101,29 @@ namespace QuestPDF.Infrastructure
 
         private static TextStyle ApplyStyleProperties(this TextStyle style, TextStyle parentStyle, StylesApplyingOptions options)
         {
-            return AvailableStyleProperties.Aggregate(style, (mutableStyle, nextProperty) =>
-                nextProperty switch
+            return TextStyleProperty
+                .GetAll()
+                .Aggregate(style, (mutableStyle, nextProperty) =>
                 {
-                    TextStyleProperty.FontFamily when string.IsNullOrWhiteSpace(mutableStyle.FontFamily) || options.OverrideFontFamily
-                        => mutableStyle.MutateStyle(TextStyleProperty.FontFamily, parentStyle.FontFamily, options.OverrideStyle),
-                    
-                    TextStyleProperty.Fallback when options.AllowFallback
-                        => mutableStyle.MutateStyle(TextStyleProperty.Fallback, parentStyle.Fallback, options.OverrideStyle),
-                    
-                    _ => mutableStyle.MutateStyle(nextProperty, parentStyle.GetValue(nextProperty), options.OverrideStyle)
+                    if (!CanBeMutate(nextProperty, mutableStyle, options))
+                        return mutableStyle;
+
+                    return mutableStyle.MutateStyle(
+                        nextProperty,
+                        parentStyle.GetValueEntry(nextProperty),
+                        overrideValue: options.OverrideStyle);
                 });
+
+            static bool CanBeMutate(TextStyleProperty property, TextStyle mutableStyle, StylesApplyingOptions applyingOptions)
+            {
+                if (property == TextStyleProperty.FontFamily)
+                    return string.IsNullOrWhiteSpace(mutableStyle.FontFamily) || applyingOptions.OverrideFontFamily;
+                
+                if (property == TextStyleProperty.Fallback)
+                    return applyingOptions.AllowFallback;
+                
+                return true;
+            }
         }
     }
 }
